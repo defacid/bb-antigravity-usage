@@ -17,16 +17,24 @@ interface StoredToken {
 }
 
 interface QuotaBucket {
+  bucketId?: string;
+  displayName?: string;
+  window?: string;
   remainingFraction?: number;
   resetTime?: string;
+  description?: string;
 }
 
 interface QuotaGroup {
   displayName?: string;
+  description?: string;
   buckets?: QuotaBucket[];
 }
 
-export interface QuotaSummary { groups?: QuotaGroup[] }
+export interface QuotaSummary {
+  groups?: QuotaGroup[];
+  description?: string;
+}
 
 function error(message: string): ProviderUsageResult {
   return { supported: true, usage: { status: "error", message, accountEmail: null, planLabel: null } };
@@ -46,15 +54,30 @@ function accountEmail(idToken: string | undefined): string | null {
 
 export function normalizeAntigravityUsage(summary: QuotaSummary, email: string | null): ProviderUsageResult {
   const windows = (summary.groups ?? []).flatMap((group) => {
-    const name = group.displayName ?? "";
-    const label = /gemini/iu.test(name)
-      ? "Weekly limit (Gemini)"
-      : /claude|gpt/iu.test(name)
-        ? "Weekly limit (Claude & GPT)"
-        : name ? `Weekly limit (${name})` : "Weekly limit";
-    return (group.buckets ?? []).map((bucket) => {
+    const groupName = group.displayName ?? "";
+    const modelFamily = /gemini/iu.test(groupName)
+      ? "Gemini"
+      : /claude|gpt/iu.test(groupName)
+        ? "Claude & GPT"
+        : groupName.trim() || "Antigravity";
+
+    const buckets = [...(group.buckets ?? [])];
+
+    // Sort buckets so that 5-hour limit comes before weekly limit
+    buckets.sort((a, b) => {
+      const aIs5h = a.window === "5h" || a.bucketId?.endsWith("-5h") || /5\s*h|five/i.test(a.displayName ?? "");
+      const bIs5h = b.window === "5h" || b.bucketId?.endsWith("-5h") || /5\s*h|five/i.test(b.displayName ?? "");
+      return (bIs5h ? 1 : 0) - (aIs5h ? 1 : 0);
+    });
+
+    return buckets.map((bucket) => {
+      const is5h = bucket.window === "5h" || bucket.bucketId?.endsWith("-5h") || /5\s*h|five/i.test(bucket.displayName ?? "");
+      const kind = is5h ? ("five-hour" as const) : ("weekly" as const);
+      const prefix = is5h ? "5h" : "7d";
+      const label = `${prefix} · ${modelFamily}`;
       const remaining = Number.isFinite(bucket.remainingFraction) ? bucket.remainingFraction! : 1;
       return {
+        kind,
         label,
         usedPercent: Math.max(0, Math.min(100, Math.round((1 - remaining) * 100))),
         resetsAt: typeof bucket.resetTime === "string" ? bucket.resetTime : null,

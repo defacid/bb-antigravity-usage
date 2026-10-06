@@ -7,6 +7,7 @@ export const hostUsageState = z.discriminatedUnion("status", [
     accountEmail: z.string().nullable(),
     planLabel: z.string().nullable(),
     windows: z.array(z.object({
+      kind: z.enum(["five-hour", "weekly", "daily", "custom"]).optional(),
       label: z.string(),
       usedPercent: z.number(),
       resetsAt: z.string().nullable(),
