@@ -134,9 +134,11 @@ function isTokenExpired(stored: StoredToken): boolean {
 }
 
 /**
- * Invoke `agy -p ""` with a short timeout so the Antigravity CLI can refresh
- * its OAuth token transparently.  We intentionally ignore stdout/stderr — the
- * side-effect we care about is the updated token file on disk.
+ * Invoke the lightweight `agy models` command with a short timeout so the
+ * Antigravity CLI can refresh its OAuth token transparently. Empty print-mode
+ * prompts exit before acquiring a token in agy 1.3.3 and later; listing models
+ * authenticates without starting an inference turn. We intentionally ignore
+ * stdout/stderr — the side-effect we care about is the updated token file.
  */
 async function refreshViaAgyCli(agyCli?: string): Promise<void> {
   if (!agyCli) return;
@@ -144,9 +146,7 @@ async function refreshViaAgyCli(agyCli?: string): Promise<void> {
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   try {
-    // `-p ""` runs a single empty print-mode turn, which causes the CLI to
-    // verify/refresh its credentials before doing anything else, then exits.
-    await execFileAsync(agyCli, ["-p", ""], { timeout: 10_000, encoding: "utf8" });
+    await execFileAsync(agyCli, ["models"], { timeout: 10_000, encoding: "utf8" });
   } catch {
     // Ignore errors — we'll re-read the token file anyway and detect failure
     // downstream via the HTTP response status.

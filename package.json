@@ -1,6 +1,6 @@
 {
   "name": "bb-antigravity-usage",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "engines": {
     "bb": ">=0.43",
@@ -17,10 +17,10 @@
     "skills": []
   },
   "dependencies": {
-    "@get-bb/plugin-sdk": "0.5.29",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@get-bb/plugin-sdk": "0.6.37",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@types/react": "^19.3.0",

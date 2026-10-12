@@ -10,7 +10,7 @@ Adds weekly Antigravity quota windows to BB's Provider Usage panel.
 
 ## Privacy and credentials
 
-The plugin reads the local login token only to make the quota request. It does not log, display, or persist access or refresh tokens. If the access token has expired, refreshing requires an OAuth client secret supplied by the user in `ANTIGRAVITY_OAUTH_CLIENT_SECRET`; the plugin contains no embedded OAuth secret.
+The plugin reads the local login token only to make the quota request. It does not log, display, or persist access or refresh tokens. If the access token is expired, it asks the locally installed `agy` CLI to refresh it by listing available models; this does not start an inference turn. As a fallback, an OAuth client secret may be supplied through `ANTIGRAVITY_OAUTH_CLIENT_SECRET`; the plugin contains no embedded OAuth secret.
 
 ## Install
 
