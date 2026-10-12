@@ -1,6 +1,6 @@
 {
   "name": "bb-antigravity-usage",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "type": "module",
   "engines": {
     "bb": ">=0.43",
