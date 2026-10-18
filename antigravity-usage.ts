@@ -11,9 +11,57 @@ const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleuse
 // from the Antigravity client in a distributable plugin.
 const USER_AGENT = "Antigravity/1.2.11";
 
+// Windows Credential Manager key used by the agy CLI to store its OAuth token.
+const WINDOWS_KEYRING_TARGET = "gemini:antigravity";
+
 interface StoredToken {
   token?: { access_token?: string; refresh_token?: string; expiry?: string };
   id_token?: string;
+}
+
+/**
+ * On Windows, agy stores its OAuth token in the Windows Credential Manager
+ * (keyring) rather than a plain JSON file. The credential blob contains the
+ * same JSON structure as the Unix token file: { token: { access_token, ... } }.
+ * This function attempts to read it via the native Win32 CredReadW API, which
+ * is available in Node via a small inline ffi call using node:ffi or a
+ * PowerShell subprocess (for portability without native addons).
+ */
+async function readStoredTokenFromWindowsKeyring(): Promise<StoredToken | null> {
+  if (process.platform !== "win32") return null;
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    // PowerShell inline: read the credential blob from Credential Manager and
+    // print it as UTF-8 JSON to stdout.
+    const script = `
+Add-Type -TypeDefinition @"
+using System;using System.Runtime.InteropServices;using System.Text;
+public static class CredReader {
+  [DllImport("Advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)]
+  static extern bool CredReadW(string t,uint type,uint flags,out IntPtr p);
+  [DllImport("Advapi32.dll")] static extern void CredFree(IntPtr p);
+  [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)]
+  struct CRED{public uint F,T;public string TN,C;public ulong LW;public uint BS;public IntPtr B;public uint P,AC;public IntPtr A;public string TA,U;}
+  public static string Read(string target){
+    IntPtr p;if(!CredReadW(target,1,0,out p))return null;
+    try{var c=Marshal.PtrToStructure<CRED>(p);if(c.BS==0)return "";var b=new byte[c.BS];Marshal.Copy(c.B,b,0,(int)c.BS);return Encoding.UTF8.GetString(b);}
+    finally{CredFree(p);}
+  }
+}
+"@ -ErrorAction Stop
+$v=[CredReader]::Read("${WINDOWS_KEYRING_TARGET}");if($v){Write-Output $v}else{exit 1}
+`.trim();
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-Command", script,
+    ], { timeout: 8_000, encoding: "utf8", windowsHide: true });
+    const trimmed = stdout.trim();
+    if (!trimmed) return null;
+    return JSON.parse(trimmed) as StoredToken;
+  } catch {
+    return null;
+  }
 }
 
 interface QuotaBucket {
@@ -174,7 +222,11 @@ export async function readAntigravityUsage(options: {
       return JSON.parse(await readFile(tokenPath, "utf8")) as StoredToken;
     } catch (cause) {
       const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
-      if (code === "ENOENT") return null;
+      if (code === "ENOENT") {
+        // On Windows, agy stores its token in the Windows Credential Manager
+        // (keyring) rather than a file. Fall back to reading from there.
+        return readStoredTokenFromWindowsKeyring();
+      }
       throw cause;
     }
   }
