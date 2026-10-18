@@ -146,7 +146,12 @@ async function refreshViaAgyCli(agyCli?: string): Promise<void> {
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   try {
-    await execFileAsync(agyCli, ["models"], { timeout: 10_000, encoding: "utf8" });
+    await execFileAsync(agyCli, ["models"], {
+      timeout: 10_000,
+      encoding: "utf8",
+      windowsHide: true,
+      env: { ...process.env, NO_COLOR: "1" },
+    });
   } catch {
     // Ignore errors — we'll re-read the token file anyway and detect failure
     // downstream via the HTTP response status.
@@ -159,7 +164,9 @@ export async function readAntigravityUsage(options: {
   agyCli?: string;
   quotaUrl?: string;
 } = {}): Promise<ProviderUsageResult> {
-  const tokenPath = options.tokenPath ?? join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
+  const tokenPath = options.tokenPath
+    ?? process.env.ANTIGRAVITY_TOKEN_PATH
+    ?? join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
   const fetcher = options.fetcher ?? fetch;
 
   async function readToken(): Promise<StoredToken | null> {
