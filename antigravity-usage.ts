@@ -3,29 +3,57 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProviderUsageResult } from "@get-bb/plugin-sdk/provider-bridge";
 
-const DEFAULT_QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-const FALLBACK_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const DEFAULT_QUOTA_SUMMARY_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const FALLBACK_QUOTA_SUMMARY_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const DEFAULT_QUOTA_DETAILED_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const FALLBACK_QUOTA_DETAILED_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+
 const REFRESH_URL = "https://oauth2.googleapis.com/token";
 const CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-// Google requires a client secret to exchange a refresh token. Never embed one
-// from the Antigravity client in a distributable plugin.
 const USER_AGENT = "Antigravity/1.2.11";
 
-// Windows Credential Manager key used by the agy CLI to store its OAuth token.
+// Windows Credential Manager key used by agy CLI to store its OAuth token.
 const WINDOWS_KEYRING_TARGET = "gemini:antigravity";
 
-interface StoredToken {
+export interface StoredToken {
   token?: { access_token?: string; refresh_token?: string; expiry?: string };
   id_token?: string;
+  id_token_email?: string;
+  auth_method?: string;
 }
 
 /**
- * On Windows, agy stores its OAuth token in the Windows Credential Manager
- * (keyring) rather than a plain JSON file. The credential blob contains the
- * same JSON structure as the Unix token file: { token: { access_token, ... } }.
- * This function attempts to read it via the native Win32 CredReadW API, which
- * is available in Node via a small inline ffi call using node:ffi or a
- * PowerShell subprocess (for portability without native addons).
+ * On macOS, agy uses go-keyring which stores the OAuth token in macOS Keychain
+ * with service "gemini" and account "antigravity", prefixed with "go-keyring-base64:".
+ */
+async function readStoredTokenFromMacKeychain(): Promise<StoredToken | null> {
+  if (process.platform !== "darwin") return null;
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    const { stdout } = await execFileAsync("security", [
+      "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w",
+    ], { timeout: 5_000, encoding: "utf8" });
+    let text = stdout.trim();
+    if (!text) return null;
+    if (text.startsWith("go-keyring-base64:")) {
+      text = Buffer.from(text.slice("go-keyring-base64:".length), "base64").toString("utf8");
+    }
+    const parsed = JSON.parse(text) as any;
+    return {
+      token: parsed.token,
+      id_token: parsed.id_token,
+      id_token_email: parsed.id_token_email,
+      auth_method: parsed.auth_method,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * On Windows, agy stores its OAuth token in Windows Credential Manager.
  */
 async function readStoredTokenFromWindowsKeyring(): Promise<StoredToken | null> {
   if (process.platform !== "win32") return null;
@@ -33,8 +61,6 @@ async function readStoredTokenFromWindowsKeyring(): Promise<StoredToken | null> 
     const { execFile } = await import("node:child_process");
     const { promisify } = await import("node:util");
     const execFileAsync = promisify(execFile);
-    // PowerShell inline: read the credential blob from Credential Manager and
-    // print it as UTF-8 JSON to stdout.
     const script = `
 Add-Type -TypeDefinition @"
 using System;using System.Runtime.InteropServices;using System.Text;
@@ -65,6 +91,9 @@ $v=[CredReader]::Read("${WINDOWS_KEYRING_TARGET}");if($v){Write-Output $v}else{e
 }
 
 interface QuotaBucket {
+  bucketId?: string;
+  displayName?: string;
+  window?: string;
   remainingFraction?: number;
   resetTime?: string;
 }
@@ -76,14 +105,45 @@ interface QuotaGroup {
 
 export interface QuotaSummary { groups?: QuotaGroup[] }
 
+export interface QuotaDetailedBucket {
+  modelId?: string;
+  tokenType?: string;
+  remainingFraction?: number;
+  resetTime?: string;
+}
+
+export interface QuotaDetailed { buckets?: QuotaDetailedBucket[] }
+
+export interface NormalizedWindow {
+  id: string;
+  kind: "five-hour" | "daily" | "weekly" | "custom";
+  label: string;
+  model: string | null;
+  usedPercent: number;
+  resetsAt: string | null;
+  cost?: { usedUsdCents: number; limitUsdCents: number } | null;
+}
+
+export interface AntigravityUsageState {
+  status: "ok" | "not_installed" | "unauthenticated" | "expired" | "error";
+  accountEmail: string | null;
+  planLabel: string | null;
+  windows: NormalizedWindow[];
+  message?: string;
+}
+
 function error(message: string): ProviderUsageResult {
   return { supported: true, usage: { status: "error", message, accountEmail: null, planLabel: null } };
 }
 
-function accountEmail(idToken: string | undefined): string | null {
-  if (!idToken) return null;
+function resolveAccountEmail(stored: StoredToken | null): string | null {
+  if (!stored) return null;
+  if (stored.id_token_email && typeof stored.id_token_email === "string") {
+    return stored.id_token_email;
+  }
+  if (!stored.id_token) return null;
   try {
-    const payload = idToken.split(".")[1];
+    const payload = stored.id_token.split(".")[1];
     if (!payload) return null;
     const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { email?: unknown };
     return typeof claims.email === "string" ? claims.email : null;
@@ -92,117 +152,322 @@ function accountEmail(idToken: string | undefined): string | null {
   }
 }
 
-export function normalizeAntigravityUsage(summary: QuotaSummary, email: string | null): ProviderUsageResult {
-  const windows = (summary.groups ?? []).flatMap((group) => {
-    const name = group.displayName ?? "";
-    const label = /gemini/iu.test(name)
-      ? "Weekly limit (Gemini)"
-      : /claude|gpt/iu.test(name)
-        ? "Weekly limit (Claude & GPT)"
-        : name ? `Weekly limit (${name})` : "Weekly limit";
-    return (group.buckets ?? []).map((bucket) => {
-      const remaining = Number.isFinite(bucket.remainingFraction) ? bucket.remainingFraction! : 1;
-      return {
-        label,
-        usedPercent: Math.max(0, Math.min(100, Math.round((1 - remaining) * 100))),
-        resetsAt: typeof bucket.resetTime === "string" ? bucket.resetTime : null,
-      };
-    });
-  });
-  if (windows.length === 0) return error("Antigravity returned no quota windows.");
-  return { supported: true, usage: { status: "ok", accountEmail: email, planLabel: "Antigravity", windows } };
-}
+export function normalizeAntigravityUsage(
+  summary: QuotaSummary | null,
+  detailed: QuotaDetailed | null,
+  email: string | null
+): ProviderUsageResult & { usage: AntigravityUsageState } {
+  const windows: NormalizedWindow[] = [];
 
-async function requestQuota(
-  accessToken: string,
-  fetcher: typeof fetch,
-  quotaUrl?: string,
-): Promise<Response> {
-  const url = quotaUrl ?? process.env.ANTIGRAVITY_QUOTA_URL ?? DEFAULT_QUOTA_URL;
-  try {
-    const res = await fetcher(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-      },
-      body: JSON.stringify({ project: "aicode-consumers" }),
-    });
-    if (res.ok || res.status === 401 || res.status === 403 || url !== DEFAULT_QUOTA_URL) {
-      return res;
+  function setWindow(window: NormalizedWindow) {
+    const existingIndex = windows.findIndex((w) => w.id === window.id);
+    if (existingIndex >= 0) {
+      windows[existingIndex] = window;
+    } else {
+      windows.push(window);
     }
-  } catch (cause) {
-    if (url !== DEFAULT_QUOTA_URL) throw cause;
   }
 
-  return fetcher(FALLBACK_QUOTA_URL, {
+  // 1. Check detailed buckets for Gemini models
+  if (detailed?.buckets && detailed.buckets.length > 0) {
+    const geminiBucket =
+      detailed.buckets.find((b) => b.modelId === "gemini-3.8-flash-tiered") ||
+      detailed.buckets.find((b) => b.modelId?.startsWith("gemini-3")) ||
+      detailed.buckets.find((b) => b.modelId?.startsWith("gemini-"));
+
+    if (geminiBucket) {
+      const remaining = Number.isFinite(geminiBucket.remainingFraction) ? geminiBucket.remainingFraction! : 1;
+      setWindow({
+        id: "gemini-5h",
+        kind: "five-hour",
+        label: "Gemini (5-hour window)",
+        model: "Gemini",
+        usedPercent: Math.max(0, Math.min(100, Math.round((1 - remaining) * 100))),
+        resetsAt: typeof geminiBucket.resetTime === "string" ? geminiBucket.resetTime : null,
+      });
+    }
+  }
+
+  // 2. Process summary groups (e.g. Gemini Models, Claude and GPT models)
+  for (const group of summary?.groups ?? []) {
+    const groupName = group.displayName ?? "";
+    const isClaudeGpt = /claude|gpt/iu.test(groupName);
+    const isGemini = /gemini/iu.test(groupName);
+
+    for (const bucket of group.buckets ?? []) {
+      const remaining = Number.isFinite(bucket.remainingFraction) ? bucket.remainingFraction! : 1;
+      const bucketId = bucket.bucketId ?? "";
+      const is5h = bucket.window === "5h" || bucketId.includes("5h");
+      const isWeekly = bucket.window === "weekly" || bucketId.includes("weekly");
+
+      let label = bucket.displayName ?? groupName;
+      let kind: "five-hour" | "weekly" | "custom" = "custom";
+      let model: string | null = null;
+
+      if (isClaudeGpt) {
+        model = "Claude & GPT";
+        if (is5h) {
+          label = "Claude & GPT (5-hour window)";
+          kind = "five-hour";
+        } else if (isWeekly) {
+          label = "Claude & GPT (Weekly window)";
+          kind = "weekly";
+        }
+      } else if (isGemini || bucketId.includes("gemini")) {
+        model = "Gemini";
+        if (is5h) {
+          label = "Gemini (5-hour window)";
+          kind = "five-hour";
+        } else if (isWeekly) {
+          label = "Gemini (Weekly window)";
+          kind = "weekly";
+        }
+      }
+
+      setWindow({
+        id: bucket.bucketId ?? `window-${windows.length}`,
+        kind,
+        label,
+        model,
+        usedPercent: Math.max(0, Math.min(100, Math.round((1 - remaining) * 100))),
+        resetsAt: typeof bucket.resetTime === "string" ? bucket.resetTime : null,
+      });
+    }
+  }
+
+  // Consistent ordering: Gemini weekly -> 5h -> Claude/GPT weekly -> 5h
+  const sortOrder: Record<string, number> = {
+    "gemini-weekly": 1,
+    "gemini-5h": 2,
+    "3p-weekly": 3,
+    "3p-5h": 4,
+  };
+  windows.sort((a, b) => (sortOrder[a.id] ?? 99) - (sortOrder[b.id] ?? 99));
+
+  if (windows.length === 0) {
+    return {
+      supported: true,
+      usage: {
+        status: "error",
+        message: "Antigravity returned no quota windows.",
+        accountEmail: email,
+        planLabel: "Antigravity",
+        windows: [],
+      },
+    };
+  }
+
+  return {
+    supported: true,
+    usage: {
+      status: "ok",
+      accountEmail: email,
+      planLabel: "Antigravity",
+      windows,
+    },
+  };
+}
+
+interface HubInfo {
+  pid?: number;
+  httpPort?: number;
+  csrfToken?: string;
+}
+
+async function findActiveHub(): Promise<HubInfo | null> {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const candidateDirs = [
+    join(homedir(), ".gemini", "antigravity", "daemon"),
+    join(homedir(), ".gemini", "antigravity-cli", "daemon"),
+    join(homedir(), ".gemini", "daemon"),
+  ];
+
+  for (const dir of candidateDirs) {
+    try {
+      const files = await readdir(dir);
+      for (const file of files) {
+        if (!file.startsWith("hub_") || !file.endsWith(".json")) continue;
+        const filePath = join(dir, file);
+        const content = await readFile(filePath, "utf8");
+        const info = JSON.parse(content) as HubInfo;
+        if (info.httpPort && info.csrfToken) {
+          if (typeof info.pid === "number") {
+            try {
+              process.kill(info.pid, 0);
+            } catch {
+              continue;
+            }
+          }
+          return info;
+        }
+      }
+    } catch {
+      // directory does not exist or is unreadable
+    }
+  }
+  return null;
+}
+
+async function fetchSummaryFromHub(hub: HubInfo, fetcher: typeof fetch): Promise<QuotaSummary | null> {
+  try {
+    const res = await fetcher(
+      `http://127.0.0.1:${hub.httpPort}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Codeium-Csrf-Token": hub.csrfToken!,
+        },
+        body: JSON.stringify({ force_refresh: true }),
+        signal: AbortSignal.timeout(4_000),
+      }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as any;
+    return (data?.response ?? data) as QuotaSummary;
+  } catch {
+    return null;
+  }
+}
+
+async function requestEndpoint(
+  url: string,
+  accessToken: string,
+  fetcher: typeof fetch,
+  body: object = { project: "aicode-consumers" }
+): Promise<Response> {
+  return fetcher(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
     },
-    body: JSON.stringify({ project: "aicode-consumers" }),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
   });
+}
+
+async function fetchQuotaData(
+  accessToken: string,
+  fetcher: typeof fetch,
+  summaryUrlOverride?: string
+): Promise<{ summary: QuotaSummary | null; detailed: QuotaDetailed | null; errorStatus?: number }> {
+  // 1. Try local language server hub if available (provides both Gemini weekly + 5h and Claude/GPT)
+  if (!summaryUrlOverride && !process.env.ANTIGRAVITY_QUOTA_URL) {
+    const hub = await findActiveHub();
+    if (hub) {
+      const hubSummary = await fetchSummaryFromHub(hub, fetcher);
+      if (hubSummary && Array.isArray(hubSummary.groups) && hubSummary.groups.length > 0) {
+        return { summary: hubSummary, detailed: null };
+      }
+    }
+  }
+
+  const summaryUrl = summaryUrlOverride ?? process.env.ANTIGRAVITY_QUOTA_URL ?? DEFAULT_QUOTA_SUMMARY_URL;
+
+  let summaryRes = await requestEndpoint(summaryUrl, accessToken, fetcher).catch(() => null);
+  if (!summaryRes || (!summaryRes.ok && summaryRes.status !== 401 && summaryRes.status !== 403)) {
+    summaryRes = await requestEndpoint(FALLBACK_QUOTA_SUMMARY_URL, accessToken, fetcher).catch(() => null);
+  }
+
+  if (summaryRes?.status === 401 || summaryRes?.status === 403) {
+    return { summary: null, detailed: null, errorStatus: summaryRes.status };
+  }
+
+  let detailedRes = await requestEndpoint(DEFAULT_QUOTA_DETAILED_URL, accessToken, fetcher).catch(() => null);
+  if (!detailedRes || (!detailedRes.ok && detailedRes.status !== 401 && detailedRes.status !== 403)) {
+    detailedRes = await requestEndpoint(FALLBACK_QUOTA_DETAILED_URL, accessToken, fetcher).catch(() => null);
+  }
+
+  const summary = summaryRes && summaryRes.ok ? ((await summaryRes.json().catch(() => null)) as QuotaSummary) : null;
+  const detailed = detailedRes && detailedRes.ok ? ((await detailedRes.json().catch(() => null)) as QuotaDetailed) : null;
+
+  return { summary, detailed };
 }
 
 async function refreshedAccessToken(refreshToken: string, fetcher: typeof fetch): Promise<string | null> {
   const clientSecret = process.env.ANTIGRAVITY_OAUTH_CLIENT_SECRET;
   if (!clientSecret) return null;
-  const response = await fetcher(REFRESH_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: CLIENT_ID,
-      client_secret: clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-    }),
-  });
-  if (!response.ok) return null;
-  const body = await response.json() as { access_token?: unknown };
-  return typeof body.access_token === "string" ? body.access_token : null;
+  try {
+    const response = await fetcher(REFRESH_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: clientSecret,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) return null;
+    const body = (await response.json()) as { access_token?: unknown };
+    return typeof body.access_token === "string" ? body.access_token : null;
+  } catch {
+    return null;
+  }
 }
 
-/** Returns true if the stored token's expiry is in the past or within 60 s. */
 function isTokenExpired(stored: StoredToken): boolean {
   const expiry = stored.token?.expiry;
   if (!expiry) return false;
   try {
-    // expiry format: "2026-10-03T21:16:36.740624162-04:00" — strip sub-second
-    // precision beyond what Date.parse handles, then parse.
     const normalized = expiry.replace(/(\.\d{3})\d+/, "$1");
     const expiryMs = Date.parse(normalized);
     if (!Number.isFinite(expiryMs)) return false;
-    return expiryMs - Date.now() < 60_000; // treat as expired if < 60 s away
+    return expiryMs - Date.now() < 60_000;
   } catch {
     return false;
   }
 }
 
-/**
- * Invoke the lightweight `agy models` command with a short timeout so the
- * Antigravity CLI can refresh its OAuth token transparently. Empty print-mode
- * prompts exit before acquiring a token in agy 1.3.3 and later; listing models
- * authenticates without starting an inference turn. We intentionally ignore
- * stdout/stderr — the side-effect we care about is the updated token file.
- */
-async function refreshViaAgyCli(agyCli?: string): Promise<void> {
-  if (!agyCli) return;
+async function resolveAgyBinary(preferredCli?: string): Promise<string | null> {
+  const candidates = [
+    preferredCli,
+    "agy",
+    "/Applications/Gemini.app/Contents/Helpers/agy",
+    join(homedir(), ".gemini", "antigravity", "bin", "agy"),
+    join(homedir(), ".gemini", "antigravity-cli", "bin", "agy"),
+  ].filter((c): c is string => Boolean(c));
+
+  const { access, constants } = await import("node:fs/promises");
+  for (const candidate of candidates) {
+    if (candidate === "agy") {
+      try {
+        const { execFile } = await import("node:child_process");
+        const { promisify } = await import("node:util");
+        await promisify(execFile)("which", ["agy"]);
+        return "agy";
+      } catch {
+        continue;
+      }
+    }
+    try {
+      await access(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Continue search
+    }
+  }
+  return null;
+}
+
+async function refreshViaAgyCli(preferredCli?: string): Promise<void> {
+  const bin = await resolveAgyBinary(preferredCli);
+  if (!bin) return;
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   try {
-    await execFileAsync(agyCli, ["models"], {
+    await execFileAsync(bin, ["models"], {
       timeout: 10_000,
       encoding: "utf8",
       windowsHide: true,
       env: { ...process.env, NO_COLOR: "1" },
     });
   } catch {
-    // Ignore errors — we'll re-read the token file anyway and detect failure
-    // downstream via the HTTP response status.
+    // Ignore errors
   }
 }
 
@@ -211,21 +476,27 @@ export async function readAntigravityUsage(options: {
   fetcher?: typeof fetch;
   agyCli?: string;
   quotaUrl?: string;
-} = {}): Promise<ProviderUsageResult> {
-  const tokenPath = options.tokenPath
-    ?? process.env.ANTIGRAVITY_TOKEN_PATH
-    ?? join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
+} = {}): Promise<ProviderUsageResult & { usage: AntigravityUsageState }> {
+  const tokenPath =
+    options.tokenPath ??
+    process.env.ANTIGRAVITY_TOKEN_PATH ??
+    join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
   const fetcher = options.fetcher ?? fetch;
 
   async function readToken(): Promise<StoredToken | null> {
     try {
-      return JSON.parse(await readFile(tokenPath, "utf8")) as StoredToken;
+      return (JSON.parse(await readFile(tokenPath, "utf8"))) as StoredToken;
     } catch (cause) {
       const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
       if (code === "ENOENT") {
-        // On Windows, agy stores its token in the Windows Credential Manager
-        // (keyring) rather than a file. Fall back to reading from there.
-        return readStoredTokenFromWindowsKeyring();
+        if (process.platform === "darwin") {
+          const fromMac = await readStoredTokenFromMacKeychain();
+          if (fromMac) return fromMac;
+        }
+        if (process.platform === "win32") {
+          return readStoredTokenFromWindowsKeyring();
+        }
+        return null;
       }
       throw cause;
     }
@@ -235,16 +506,24 @@ export async function readAntigravityUsage(options: {
   try {
     stored = await readToken();
   } catch {
-    return error("Could not read the Antigravity authentication token.");
+    return error("Could not read Antigravity authentication token.") as any;
   }
 
-  if (!stored) return { supported: true, usage: { status: "unauthenticated" } };
+  if (!stored) {
+    return {
+      supported: true,
+      usage: { status: "unauthenticated", accountEmail: null, planLabel: null, windows: [] },
+    };
+  }
 
   let accessToken = stored.token?.access_token;
-  if (!accessToken) return { supported: true, usage: { status: "unauthenticated" } };
+  if (!accessToken) {
+    return {
+      supported: true,
+      usage: { status: "unauthenticated", accountEmail: null, planLabel: null, windows: [] },
+    };
+  }
 
-  // Proactively refresh via the agy CLI if the token is expired or near expiry,
-  // before making the quota request.
   if (isTokenExpired(stored)) {
     await refreshViaAgyCli(options.agyCli);
     try {
@@ -253,37 +532,55 @@ export async function readAntigravityUsage(options: {
         stored = refreshed;
         accessToken = refreshed.token.access_token;
       }
-    } catch { /* ignore, proceed with existing token */ }
+    } catch {
+      // Proceed with existing token
+    }
   }
 
   try {
-    let response = await requestQuota(accessToken, fetcher, options.quotaUrl);
+    let { summary, detailed, errorStatus } = await fetchQuotaData(accessToken, fetcher, options.quotaUrl);
 
-    if (response.status === 401) {
-      // Token was rejected. Try CLIENT_SECRET refresh first (if available), then
-      // fall back to re-invoking the agy CLI.
+    if (errorStatus === 401) {
       let refreshedToken: string | null = null;
       if (stored.token?.refresh_token) {
         refreshedToken = await refreshedAccessToken(stored.token.refresh_token, fetcher);
       }
       if (!refreshedToken) {
-        // agy CLI refresh (no client secret needed)
         await refreshViaAgyCli(options.agyCli);
         try {
           const reread = await readToken();
           refreshedToken = reread?.token?.access_token ?? null;
-        } catch { /* ignore */ }
+          if (reread) stored = reread;
+        } catch {
+          // Ignore
+        }
       }
-      if (!refreshedToken) return { supported: true, usage: { status: "expired" } };
-      response = await requestQuota(refreshedToken, fetcher, options.quotaUrl);
+      if (!refreshedToken) {
+        return {
+          supported: true,
+          usage: { status: "expired", accountEmail: null, planLabel: null, windows: [] },
+        };
+      }
+      accessToken = refreshedToken;
+      const retryResult = await fetchQuotaData(accessToken, fetcher, options.quotaUrl);
+      summary = retryResult.summary;
+      detailed = retryResult.detailed;
+      errorStatus = retryResult.errorStatus;
     }
 
-    if (response.status === 401 || response.status === 403) {
-      return { supported: true, usage: { status: "expired" } };
+    if (errorStatus === 401 || errorStatus === 403) {
+      return {
+        supported: true,
+        usage: { status: "expired", accountEmail: null, planLabel: null, windows: [] },
+      };
     }
-    if (!response.ok) return error(`Antigravity quota request failed (HTTP ${response.status}).`);
-    return normalizeAntigravityUsage(await response.json() as QuotaSummary, accountEmail(stored.id_token));
+
+    if (!summary && !detailed) {
+      return error("Antigravity quota request failed.") as any;
+    }
+
+    return normalizeAntigravityUsage(summary, detailed, resolveAccountEmail(stored));
   } catch (cause) {
-    return error(cause instanceof Error ? cause.message : String(cause));
+    return error(cause instanceof Error ? cause.message : String(cause)) as any;
   }
 }
