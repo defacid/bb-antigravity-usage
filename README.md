@@ -18,6 +18,7 @@ Adds Antigravity and Gemini quota windows (weekly and 5-hour smoothing limits) t
 - **Live Quota Windows**: Displays both Gemini models (weekly limit and 5-hour window) and 3rd-party models (Claude & GPT weekly and 5-hour limits).
 - **Local Hub Integration**: Connects to the active local Language Server daemon hub (`~/.gemini/antigravity/daemon/hub_*.json`) when available, providing instant zero-latency quota updates matching the desktop app.
 - **Fallback to Cloud Code API**: If the desktop client is closed, falls back to `daily-cloudcode-pa.googleapis.com` where active quotas are served.
+- **Quiet macOS polling**: Prefers the Hub before credentials, ignores an expired legacy token file when Keychain has the current login, and caches Keychain reads until the access token is near expiry. Current macOS builds are not refreshed with `agy models`, because that command no longer updates the legacy token file and can cause repeated Keychain prompts.
 - **CLI Command**: Inspect quotas directly from the terminal:
   ```sh
   bb antigravity-quota
@@ -27,7 +28,7 @@ Adds Antigravity and Gemini quota windows (weekly and 5-hour smoothing limits) t
 
 ## Privacy and credentials
 
-The plugin reads the local login token only to make the quota request. It does not log, display, or persist access or refresh tokens. If the access token is expired, it asks the locally installed `agy` CLI to refresh it by listing available models; this does not start an inference turn. As a fallback, an OAuth client secret may be supplied through `ANTIGRAVITY_OAUTH_CLIENT_SECRET`; the plugin contains no embedded OAuth secret.
+The plugin reads the local login token only to make the quota request. It does not log, display, or persist access or refresh tokens. On non-macOS platforms, if the access token is expired, it asks the locally installed `agy` CLI to refresh it by listing available models; this does not start an inference turn. As a fallback, an OAuth client secret may be supplied through `ANTIGRAVITY_OAUTH_CLIENT_SECRET`; the plugin contains no embedded OAuth secret.
 
 ## Install
 

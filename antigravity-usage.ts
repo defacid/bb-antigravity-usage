@@ -14,6 +14,7 @@ const USER_AGENT = "Antigravity/1.2.11";
 
 // Windows Credential Manager key used by agy CLI to store its OAuth token.
 const WINDOWS_KEYRING_TARGET = "gemini:antigravity";
+const KEYCHAIN_FAILURE_CACHE_MS = 5 * 60_000;
 
 export interface StoredToken {
   token?: { access_token?: string; refresh_token?: string; expiry?: string };
@@ -22,34 +23,72 @@ export interface StoredToken {
   auth_method?: string;
 }
 
+let macKeychainCache: { value: StoredToken | null; expiresAt: number } | null = null;
+let macKeychainReadInFlight: Promise<StoredToken | null> | null = null;
+
+function tokenExpiryMs(stored: StoredToken): number | null {
+  const expiry = stored.token?.expiry;
+  if (!expiry) return null;
+  const normalized = expiry.replace(/(\.\d{3})\d+/, "$1");
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function cacheMacKeychainValue(value: StoredToken | null): StoredToken | null {
+  const now = Date.now();
+  const expiryMs = value ? tokenExpiryMs(value) : null;
+  macKeychainCache = {
+    value,
+    expiresAt: expiryMs && expiryMs > now + 60_000
+      ? expiryMs - 60_000
+      : now + KEYCHAIN_FAILURE_CACHE_MS,
+  };
+  return value;
+}
+
+function invalidateMacKeychainCache(): void {
+  macKeychainCache = null;
+}
+
 /**
  * On macOS, agy uses go-keyring which stores the OAuth token in macOS Keychain
  * with service "gemini" and account "antigravity", prefixed with "go-keyring-base64:".
  */
 async function readStoredTokenFromMacKeychain(): Promise<StoredToken | null> {
   if (process.platform !== "darwin") return null;
-  try {
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execFileAsync = promisify(execFile);
-    const { stdout } = await execFileAsync("security", [
-      "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w",
-    ], { timeout: 5_000, encoding: "utf8" });
-    let text = stdout.trim();
-    if (!text) return null;
-    if (text.startsWith("go-keyring-base64:")) {
-      text = Buffer.from(text.slice("go-keyring-base64:".length), "base64").toString("utf8");
-    }
-    const parsed = JSON.parse(text) as any;
-    return {
-      token: parsed.token,
-      id_token: parsed.id_token,
-      id_token_email: parsed.id_token_email,
-      auth_method: parsed.auth_method,
-    };
-  } catch {
-    return null;
+  if (macKeychainCache && macKeychainCache.expiresAt > Date.now()) {
+    return macKeychainCache.value;
   }
+  if (macKeychainReadInFlight) return macKeychainReadInFlight;
+
+  macKeychainReadInFlight = (async () => {
+    try {
+      const { execFile } = await import("node:child_process");
+      const { promisify } = await import("node:util");
+      const execFileAsync = promisify(execFile);
+      const { stdout } = await execFileAsync("security", [
+        "find-generic-password", "-s", "gemini", "-a", "antigravity", "-w",
+      ], { timeout: 5_000, encoding: "utf8" });
+      let text = stdout.trim();
+      if (!text) return cacheMacKeychainValue(null);
+      if (text.startsWith("go-keyring-base64:")) {
+        text = Buffer.from(text.slice("go-keyring-base64:".length), "base64").toString("utf8");
+      }
+      const parsed = JSON.parse(text) as any;
+      return cacheMacKeychainValue({
+        token: parsed.token,
+        id_token: parsed.id_token,
+        id_token_email: parsed.id_token_email,
+        auth_method: parsed.auth_method,
+      });
+    } catch {
+      return cacheMacKeychainValue(null);
+    }
+  })().finally(() => {
+    macKeychainReadInFlight = null;
+  });
+
+  return macKeychainReadInFlight;
 }
 
 /**
@@ -115,13 +154,14 @@ export interface QuotaDetailedBucket {
 export interface QuotaDetailed { buckets?: QuotaDetailedBucket[] }
 
 export interface NormalizedWindow {
+  [key: string]: unknown;
   id: string;
   kind: "five-hour" | "daily" | "weekly" | "custom";
   label: string;
   model: string | null;
   usedPercent: number;
   resetsAt: string | null;
-  cost?: { usedUsdCents: number; limitUsdCents: number } | null;
+  cost?: { usedUsdCents: number; limitUsdCents: number };
 }
 
 export interface AntigravityUsageState {
@@ -353,17 +393,6 @@ async function fetchQuotaData(
   fetcher: typeof fetch,
   summaryUrlOverride?: string
 ): Promise<{ summary: QuotaSummary | null; detailed: QuotaDetailed | null; errorStatus?: number }> {
-  // 1. Try local language server hub if available (provides both Gemini weekly + 5h and Claude/GPT)
-  if (!summaryUrlOverride && !process.env.ANTIGRAVITY_QUOTA_URL) {
-    const hub = await findActiveHub();
-    if (hub) {
-      const hubSummary = await fetchSummaryFromHub(hub, fetcher);
-      if (hubSummary && Array.isArray(hubSummary.groups) && hubSummary.groups.length > 0) {
-        return { summary: hubSummary, detailed: null };
-      }
-    }
-  }
-
   const summaryUrl = summaryUrlOverride ?? process.env.ANTIGRAVITY_QUOTA_URL ?? DEFAULT_QUOTA_SUMMARY_URL;
 
   let summaryRes = await requestEndpoint(summaryUrl, accessToken, fetcher).catch(() => null);
@@ -410,16 +439,8 @@ async function refreshedAccessToken(refreshToken: string, fetcher: typeof fetch)
 }
 
 function isTokenExpired(stored: StoredToken): boolean {
-  const expiry = stored.token?.expiry;
-  if (!expiry) return false;
-  try {
-    const normalized = expiry.replace(/(\.\d{3})\d+/, "$1");
-    const expiryMs = Date.parse(normalized);
-    if (!Number.isFinite(expiryMs)) return false;
-    return expiryMs - Date.now() < 60_000;
-  } catch {
-    return false;
-  }
+  const expiryMs = tokenExpiryMs(stored);
+  return expiryMs !== null && expiryMs - Date.now() < 60_000;
 }
 
 async function resolveAgyBinary(preferredCli?: string): Promise<string | null> {
@@ -483,23 +504,40 @@ export async function readAntigravityUsage(options: {
     join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
   const fetcher = options.fetcher ?? fetch;
 
+  // A running desktop Language Server already has an authenticated session.
+  // Prefer it before touching local credentials, so passive Usage polling does
+  // not cause macOS Keychain prompts.
+  if (!options.quotaUrl && !process.env.ANTIGRAVITY_QUOTA_URL) {
+    const hub = await findActiveHub();
+    if (hub) {
+      const hubSummary = await fetchSummaryFromHub(hub, fetcher);
+      if (hubSummary && Array.isArray(hubSummary.groups) && hubSummary.groups.length > 0) {
+        return normalizeAntigravityUsage(hubSummary, null, null);
+      }
+    }
+  }
+
   async function readToken(): Promise<StoredToken | null> {
+    let fromFile: StoredToken | null = null;
     try {
-      return (JSON.parse(await readFile(tokenPath, "utf8"))) as StoredToken;
+      fromFile = (JSON.parse(await readFile(tokenPath, "utf8"))) as StoredToken;
     } catch (cause) {
       const code = cause && typeof cause === "object" && "code" in cause ? cause.code : null;
-      if (code === "ENOENT") {
-        if (process.platform === "darwin") {
-          const fromMac = await readStoredTokenFromMacKeychain();
-          if (fromMac) return fromMac;
-        }
-        if (process.platform === "win32") {
-          return readStoredTokenFromWindowsKeyring();
-        }
-        return null;
-      }
-      throw cause;
+      if (code !== "ENOENT") throw cause;
     }
+
+    // Recent agy builds use Keychain on macOS but can leave an old plaintext
+    // token file behind. Do not let that stale file mask the current login.
+    if (fromFile && !isTokenExpired(fromFile)) return fromFile;
+    if (process.platform === "darwin") {
+      const fromMac = await readStoredTokenFromMacKeychain();
+      if (fromMac) return fromMac;
+    }
+    if (process.platform === "win32") {
+      const fromWindows = await readStoredTokenFromWindowsKeyring();
+      if (fromWindows) return fromWindows;
+    }
+    return fromFile;
   }
 
   let stored: StoredToken | null;
@@ -525,7 +563,10 @@ export async function readAntigravityUsage(options: {
   }
 
   if (isTokenExpired(stored)) {
-    await refreshViaAgyCli(options.agyCli);
+    // On macOS `agy models` now starts a separate Language Server that reads
+    // Keychain but does not update the legacy token file. Repeating it from
+    // the Usage poller caused a prompt/process storm without refreshing us.
+    if (process.platform !== "darwin") await refreshViaAgyCli(options.agyCli);
     try {
       const refreshed = await readToken();
       if (refreshed?.token?.access_token) {
@@ -546,7 +587,8 @@ export async function readAntigravityUsage(options: {
         refreshedToken = await refreshedAccessToken(stored.token.refresh_token, fetcher);
       }
       if (!refreshedToken) {
-        await refreshViaAgyCli(options.agyCli);
+        if (process.platform === "darwin") invalidateMacKeychainCache();
+        else await refreshViaAgyCli(options.agyCli);
         try {
           const reread = await readToken();
           refreshedToken = reread?.token?.access_token ?? null;
