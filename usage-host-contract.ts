@@ -10,6 +10,8 @@ export const hostUsageState = z.discriminatedUnion("status", [
       label: z.string(),
       usedPercent: z.number(),
       resetsAt: z.string().nullable(),
+      kind: z.enum(["five-hour", "weekly"]).optional(),
+      model: z.string().nullable().optional(),
       cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
     })),
   }),
