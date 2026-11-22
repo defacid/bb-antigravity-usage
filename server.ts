@@ -10,7 +10,7 @@ const usageState = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("ok"), plan: z.null(), accountEmail: z.string().nullable(), planLabel: z.string().nullable(),
     windows: z.array(z.object({
-      kind: z.literal("weekly"), id: z.string().min(1), label: z.string().min(1),
+      kind: z.enum(["five-hour", "weekly"]), id: z.string().min(1), label: z.string().min(1),
       usedPercent: z.number().nonnegative(), resetsAt: z.string().nullable(), model: z.string().nullable(), cost: z.null(),
     })),
   }),
@@ -44,13 +44,14 @@ export default function plugin(bb: BbPluginApi): void {
       })),
     }),
     [GET_RESOURCE]: async ({ resourceId }) => {
-      const state = await usageHost.call("usage.readAntigravity", {}, { hostId: resourceId, timeoutMs: 20_000 });
+      const state = await usageHost.call("usage.readAntigravity", {}, { hostId: resourceId, timeoutMs: 30_000 });
       const base = { accountKey: null, observedAt: Date.now() };
       if (state.status === "ok") return { ...base, usage: {
         status: "ok" as const, plan: null, accountEmail: state.accountEmail, planLabel: state.planLabel,
         windows: state.windows.map((window, index) => ({
-          kind: "weekly" as const, id: `antigravity-${index}`, label: window.label, usedPercent: window.usedPercent,
-          resetsAt: window.resetsAt, model: window.label.includes("Gemini") ? "Gemini" : window.label.includes("Claude") ? "Claude & GPT" : null, cost: null,
+          kind: window.kind ?? "weekly", id: `antigravity-${index}`, label: window.label, usedPercent: window.usedPercent,
+          resetsAt: window.resetsAt, cost: null,
+          model: window.model ?? (window.label.includes("Gemini") ? "Gemini" : window.label.includes("Claude") ? "Claude & GPT" : null),
         })),
       } };
       if (state.status === "error") return { ...base, usage: { status: "error" as const, plan: null, accountEmail: null, planLabel: null, message: state.message } };

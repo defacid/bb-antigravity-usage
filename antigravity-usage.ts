@@ -206,12 +206,114 @@ async function refreshViaAgyCli(agyCli?: string): Promise<void> {
   }
 }
 
+/** Bucket in the `command.data` payload of `agy -p /usage --output-format json`. */
+interface AgyUsageBucket {
+  id?: string;
+  name?: string;
+  window?: string;
+  remaining_fraction?: number;
+  reset_time?: string;
+}
+
+interface AgyUsageGroup {
+  name?: string;
+  buckets?: AgyUsageBucket[];
+}
+
+/** Print-mode result of `agy -p /usage --output-format json` (agy 1.5+). */
+export interface AgyUsageResult {
+  status?: string;
+  error?: string;
+  command?: { name?: string; data?: { groups?: AgyUsageGroup[] } };
+}
+
+export type UsageWindowKind = "five-hour" | "weekly";
+
+function groupLabel(name: string): string {
+  if (/^gemini models$/iu.test(name)) return "Gemini";
+  if (/claude|gpt/iu.test(name)) return "Claude & GPT";
+  return name || "Antigravity";
+}
+
+/**
+ * Normalize the structured `/usage` command output from the agy CLI. Returns
+ * null when the payload is not a `/usage` result (for example an older agy
+ * that has no `/usage` print-mode command), so the caller can fall back.
+ */
+export function normalizeAgyUsageCommand(result: AgyUsageResult): ProviderUsageResult | null {
+  if (result.status && result.status !== "SUCCESS") {
+    const message = result.error ?? "Antigravity usage command failed.";
+    if (/not logged in|log ?in|sign ?in|authenticat/iu.test(message)) {
+      return { supported: true, usage: { status: "unauthenticated" } };
+    }
+    return error(message);
+  }
+  const groups = result.command?.name === "usage" ? result.command.data?.groups : undefined;
+  if (!Array.isArray(groups)) return null;
+  const windows = groups.flatMap((group) => {
+    const model = groupLabel(group.name ?? "");
+    return (group.buckets ?? []).map((bucket) => {
+      const kind: UsageWindowKind = bucket.window === "5h" ? "five-hour" : "weekly";
+      const remaining = Number.isFinite(bucket.remaining_fraction) ? bucket.remaining_fraction! : 1;
+      return {
+        label: `${kind === "five-hour" ? "5-hour limit" : "Weekly limit"} (${model})`,
+        usedPercent: Math.max(0, Math.min(100, Math.round((1 - remaining) * 100))),
+        resetsAt: typeof bucket.reset_time === "string" ? bucket.reset_time : null,
+        kind,
+        model,
+      };
+    });
+  });
+  if (windows.length === 0) return error("Antigravity returned no quota windows.");
+  return { supported: true, usage: { status: "ok", accountEmail: null, planLabel: "Antigravity", windows } };
+}
+
+/**
+ * Ask the agy CLI for quota with its `/usage` print-mode command. agy handles
+ * its own sign-in (including the macOS Keychain), so no token is read here and
+ * no inference turn is started. Returns null when agy is missing or does not
+ * support the command, so the caller can fall back to the token file.
+ */
+export async function readUsageViaAgyCli(agyCli: string): Promise<ProviderUsageResult | null> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(agyCli, ["-p", "/usage", "--output-format", "json"], {
+      timeout: 15_000,
+      encoding: "utf8",
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, NO_COLOR: "1" },
+    }));
+  } catch (cause) {
+    // agy exits 2 when /usage has no account quota to show (API-key sign-in).
+    const failure = cause as { code?: unknown; stdout?: unknown };
+    if (failure.code === 2 && typeof failure.stdout === "string") {
+      stdout = failure.stdout;
+    } else {
+      return null;
+    }
+  }
+  try {
+    return normalizeAgyUsageCommand(JSON.parse(stdout) as AgyUsageResult);
+  } catch {
+    return null;
+  }
+}
+
 export async function readAntigravityUsage(options: {
   tokenPath?: string;
   fetcher?: typeof fetch;
   agyCli?: string;
   quotaUrl?: string;
 } = {}): Promise<ProviderUsageResult> {
+  if (options.agyCli) {
+    const viaCli = await readUsageViaAgyCli(options.agyCli);
+    if (viaCli) return viaCli;
+  }
+
   const tokenPath = options.tokenPath
     ?? process.env.ANTIGRAVITY_TOKEN_PATH
     ?? join(homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token");
